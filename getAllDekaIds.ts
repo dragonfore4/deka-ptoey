@@ -1,7 +1,7 @@
 // export async function getAllDekaIds(startYear, endYear, totalPages) {
 //     const resultList = [];
 
-import { GET_DEKA_ID_CONCURRENCY_LIMIT } from "./main";
+const GET_DEKA_ID_CONCURRENCY_LIMIT = 5;
 
 //     const fetchPageWithRetry = async (url, payload, retries = 3) => {
 //         let lastError;

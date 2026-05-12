@@ -1,9 +1,9 @@
 import fs from "fs";
 import path from "path";
-
-const DEKA_PRINT_URL = "https://deka.supremecourt.or.th/printing/deka";
-const GOTENBERG_BASE_URL = (process.env.GOTENBERG_URL || "http://127.0.0.1:3000").replace(/\/$/, "");
-const GOTENBERG_HTML_URL = `${GOTENBERG_BASE_URL}/forms/chromium/convert/html`;
+import config from "./config.js";
+import httpClient from "./utils/httpClient.js";
+import { logger } from "./utils/logger.js";
+import { checkpointManager } from "./utils/checkpointManager.js";
 
 function buildPayload(docId: string) {
   const payload = new URLSearchParams();
@@ -23,7 +23,7 @@ function buildPayload(docId: string) {
 }
 
 function ensureDownloadPath(folderName: string) {
-  const downloadPath = path.join("downloads", folderName);
+  const downloadPath = path.join(config.DOWNLOAD_DIR, folderName);
 
   if (!fs.existsSync(downloadPath)) {
     fs.mkdirSync(downloadPath, { recursive: true });
@@ -32,10 +32,10 @@ function ensureDownloadPath(folderName: string) {
   return downloadPath;
 }
 
-function looksLikePdf(contentType: string, body: Buffer) {
+function looksLikePdf(contentType: string, body: ArrayBuffer) {
   return (
     contentType.includes("application/pdf") ||
-    body.slice(0, 4).toString("utf8") === "%PDF"
+    Buffer.from(body).slice(0, 4).toString("utf8") === "%PDF"
   );
 }
 
@@ -57,6 +57,10 @@ function prepareHtmlForGotenberg(htmlContent: string) {
 }
 
 async function renderWithGotenberg(htmlContent: string, filePath: string) {
+  if (!config.ENABLE_GOTENBERG) {
+    throw new Error("Gotenberg is disabled in configuration");
+  }
+
   const formData = new FormData();
   formData.append(
     "files",
@@ -64,24 +68,25 @@ async function renderWithGotenberg(htmlContent: string, filePath: string) {
     "index.html",
   );
 
-  const response = await fetch(GOTENBERG_HTML_URL, {
-    method: "POST",
-    body: formData,
-  });
+  const response = await httpClient.requestWithRetry<ArrayBuffer>(
+    config.GOTENBERG_HTML_URL,
+    {
+      method: "POST",
+      body: formData,
+    },
+    config.RETRY_LIMIT,
+    config.INITIAL_RETRY_DELAY_MS,
+    config.MAX_RETRY_DELAY_MS,
+  );
 
-  if (!response.ok) {
-    const message = await response.text();
-    throw new Error(`Gotenberg error! status: ${response.status} ${message}`);
-  }
-
-  const pdfBytes = Buffer.from(await response.arrayBuffer());
-
-  if (!looksLikePdf(response.headers.get("content-type") || "", pdfBytes)) {
+  if (
+    !looksLikePdf(response.headers.get("content-type") || "", response.data)
+  ) {
     throw new Error("Gotenberg returned a non-PDF response");
   }
 
-  fs.writeFileSync(filePath, pdfBytes);
-  console.log(`✅ แปลงสำเร็จผ่าน Gotenberg: ${filePath}`);
+  fs.writeFileSync(filePath, Buffer.from(response.data));
+  logger.info(`✅ Converted successfully via Gotenberg: ${filePath}`);
 }
 
 export async function downloadDekaPDF(docId: string, folderName: string) {
@@ -90,35 +95,43 @@ export async function downloadDekaPDF(docId: string, folderName: string) {
     const downloadPath = ensureDownloadPath(folderName);
     const filePath = path.join(downloadPath, `deka_${docId}.pdf`);
 
-    const response = await fetch(DEKA_PRINT_URL, {
-      method: "POST",
-      headers: {
-        "content-type": "application/x-www-form-urlencoded",
-        "user-agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-      },
-      body: payload.toString(),
-      // verbose: true
-    });
-
-    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
-
-    const contentType = response.headers.get("content-type") || "";
-    const body = Buffer.from(await response.arrayBuffer());
-
-    if (looksLikePdf(contentType, body)) {
-      fs.writeFileSync(filePath, body);
-      console.log(`✅ บันทึก PDF ตรงจากเซิร์ฟเวอร์: ${filePath}`);
+    // Check if file already exists
+    if (fs.existsSync(filePath)) {
+      logger.info(`⏭️  File already exists, skipping: ${filePath}`);
       return true;
     }
 
-    const htmlContent = body.toString("utf8");
-    console.log(`กำลังส่ง ID ${docId} ไปแปลงด้วย Gotenberg...`);
+    const response = await httpClient.requestWithRetry<ArrayBuffer>(
+      config.DEKA_PRINT_URL,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          "user-agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        },
+        body: payload.toString(),
+      },
+      config.RETRY_LIMIT,
+      config.INITIAL_RETRY_DELAY_MS,
+      config.MAX_RETRY_DELAY_MS,
+    );
+
+    const contentType = response.headers.get("content-type") || "";
+
+    if (looksLikePdf(contentType, response.data)) {
+      fs.writeFileSync(filePath, Buffer.from(response.data));
+      logger.info(`✅ Saved PDF directly from server: ${filePath}`);
+      return true;
+    }
+
+    const htmlContent = Buffer.from(response.data).toString("utf8");
+    logger.info(`Sending ID ${docId} for conversion with Gotenberg...`);
 
     await renderWithGotenberg(htmlContent, filePath);
     return true;
   } catch (error: any) {
-    console.error(`❌ โหลด ID ${docId} พัง:`, error.message);
+    logger.error(`❌ Failed to download ID ${docId}`, error);
     return false;
   }
 }
